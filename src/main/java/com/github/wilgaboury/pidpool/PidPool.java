@@ -6,119 +6,161 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Queue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class PidPool<T> {
   private static final Cleaner cleaner = Cleaner.create();
 
-  private final PoolLifecycle<T> lifecycle;
-  private final Queue<T> queue;
-  private final Ref<Integer> maxSize;
+  private static class State<T> {
+    private final PoolLifecycle<T> lifecycle;
+    private final Queue<T> queue; // synchronized
+    private int maxSize; // synchronized by queue
+
+    private final Object inUseLock;
+    private int inUseSkip;
+    private int inUse;
+
+    public State(PoolLifecycle<T> lifecycle) {
+      this.lifecycle = lifecycle;
+      this.queue = new ArrayDeque<>();
+      this.maxSize = 0;
+      this.inUseLock = new Object();
+      this.inUseSkip = 0;
+      this.inUse = 0;
+    }
+
+    public void setMaxSize(int newMaxSize) {
+      ArrayList<T> destroy = null;
+
+      synchronized (queue) {
+        maxSize = newMaxSize;
+        int diff = queue.size() - newMaxSize;
+        if (diff > 0) {
+          destroy = new ArrayList<>(maxSize);
+          for (; diff > 0; diff--) {
+            destroy.add(queue.poll());
+          }
+        }
+      }
+
+      if (destroy != null) {
+        for (var obj : destroy) {
+          lifecycle.destroy(obj);
+        }
+      }
+    }
+  }
+
+  private final State<T> state;
   private final ReferenceQueue<T> referenceQueue;
-  private final AtomicInteger inUse;
 
   public PidPool(PoolLifecycle<T> lifecycle) {
-    this.lifecycle = lifecycle;
-    this.queue = new ArrayDeque<>();
-    this.maxSize = new Ref<>(0);
+    this.state = new State<>(lifecycle);
     this.referenceQueue = new ReferenceQueue<>();
-    this.inUse = new AtomicInteger(0);
 
-    Thread referenceThread = new Thread(PidPool.referenceThreadLoop(lifecycle, referenceQueue, queue, maxSize));
+    Thread referenceThread = new Thread(PidPool.referenceThreadLoop(state, referenceQueue));
     referenceThread.setDaemon(true);
     referenceThread.start();
 
-    cleaner.register(this, PidPool.cleanup(referenceThread));
+    ScheduledExecutorService controlService = Executors.newSingleThreadScheduledExecutor();
+    controlService.scheduleAtFixedRate(PidPool.controlLoop(state), 500, 500, TimeUnit.MILLISECONDS);
+
+    cleaner.register(this, PidPool.cleanup(state, referenceThread, controlService));
   }
 
   public T take() {
     T obj = null;
 
-    synchronized (queue) {
-      if (!queue.isEmpty()) {
-        obj = queue.poll();
+    synchronized (state.queue) {
+      if (!state.queue.isEmpty()) {
+        obj = state.queue.poll();
       }
     }
 
     if (obj != null) {
-      lifecycle.onDequeue(obj);
+      state.lifecycle.onDequeue(obj);
     } else {
-      obj = lifecycle.create();
+      obj = state.lifecycle.create();
       new WeakReference<>(obj, referenceQueue);
     }
 
-    inUse.incrementAndGet();
+    synchronized (state.inUseLock) {
+      state.inUse++;
+    }
     return obj;
   }
 
   public void give(T obj) {
-    synchronized (queue) {
-      if (queue.size() < maxSize.get()) {
-        queue.add(obj);
+    synchronized (state.queue) {
+      if (state.queue.size() < state.maxSize) {
+        state.queue.add(obj);
         obj = null;
       }
     }
 
-    if (obj != null) {
-      lifecycle.destroy(obj);
+    synchronized (state.inUseLock) {
+      state.inUseSkip++;
+      state.inUse--;
     }
 
-    inUse.decrementAndGet();
+    if (obj != null) {
+      state.lifecycle.destroy(obj);
+    }
   }
 
   public int getInUse() {
-    return inUse.get();
+    synchronized (state.inUseLock) {
+      return state.inUse;
+    }
   }
 
   public int getMaxSize() {
-    synchronized (queue) {
-      return maxSize.get();
+    synchronized (state.queue) {
+      return state.maxSize;
     }
   }
 
-  public void setMaxSize(int newMaxSize) {
-    ArrayList<T> destroy = null;
-
-    synchronized (queue) {
-      maxSize.set(newMaxSize);
-      int diff = queue.size() - newMaxSize;
-      if (diff > 0) {
-        destroy = new ArrayList<>(maxSize.get());
-        for (; diff > 0; diff--) {
-          destroy.add(queue.poll());
-        }
+  private static <T> Runnable cleanup(State<T> state, Thread referenceThread, ExecutorService controlService) {
+    return () -> {
+      referenceThread.interrupt();
+      controlService.shutdown();
+      try {
+        controlService.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
       }
-    }
-
-    if (destroy != null) {
-      for (var obj : destroy) {
-        lifecycle.destroy(obj);
+      while (!state.queue.isEmpty()) {
+        var obj = state.queue.poll();
+        state.lifecycle.destroy(obj);
       }
-    }
+    };
   }
 
-  private static Runnable cleanup(Thread referenceThread) {
-    return referenceThread::interrupt;
+  private static <T> Runnable controlLoop(State<T> state) {
+    return () -> {
+      int inUse;
+      synchronized (state.inUseLock) {
+        inUse = state.inUse;
+      }
+      state.setMaxSize(inUse);
+    };
   }
 
-  private static <T> Runnable referenceThreadLoop(PoolLifecycle<T> lifecycle, ReferenceQueue<T> referenceQueue, Queue<T> queue, Ref<Integer> maxSize) {
+  private static <T> Runnable referenceThreadLoop(State<T> state, ReferenceQueue<T> referenceQueue) {
     return () -> {
       try {
         while (true) {
-          var objRef = referenceQueue.remove();
-          T obj = null;
-          synchronized (queue) {
-            if (queue.size() < maxSize.get()) {
-              obj = objRef.get();
-              if (obj != null) {
-                queue.add(obj);
-              }
+          referenceQueue.remove();
+          synchronized (state.inUseLock) {
+            if (state.inUseSkip > 0) {
+              state.inUseSkip--;
+            } else {
+              state.inUse--;
             }
-          }
-
-          if (obj != null) {
-            var obj0 = obj;
-            Thread.ofVirtual().factory().newThread(() -> lifecycle.onEnqueue(obj0));
           }
         }
       } catch (InterruptedException e) {
