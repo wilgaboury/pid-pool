@@ -12,7 +12,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-public class PidPool<T> {
+public class ControlPool<T> {
   private static final Cleaner cleaner = Cleaner.create();
 
   private static class State<T> {
@@ -52,13 +52,13 @@ public class PidPool<T> {
 
   private final State<T> state;
 
-  public PidPool(PoolLifecycle<T> lifecycle) {
+  public ControlPool(PoolLifecycle<T> lifecycle, long intervalMillis, PoolControl control) {
     this.state = new State<>(lifecycle);
 
     ScheduledExecutorService controlService = Executors.newSingleThreadScheduledExecutor();
-    controlService.scheduleAtFixedRate(PidPool.controlLoop(state), 500, 500, TimeUnit.MILLISECONDS);
+    controlService.scheduleAtFixedRate(ControlPool.controlLoop(state, control), intervalMillis, intervalMillis, TimeUnit.MILLISECONDS);
 
-    cleaner.register(this, PidPool.cleanupPool(state, controlService));
+    cleaner.register(this, ControlPool.cleanupPool(state, controlService));
   }
 
   public T take() {
@@ -91,7 +91,9 @@ public class PidPool<T> {
       }
     }
 
-    if (obj != null) {
+    if (obj == null) {
+      state.lifecycle.onEnqueue(obj);
+    } else {
       state.lifecycle.destroy(obj);
     }
   }
@@ -106,9 +108,9 @@ public class PidPool<T> {
     }
   }
 
-  private static <T> Runnable controlLoop(State<T> state) {
+  private static <T> Runnable controlLoop(State<T> state, PoolControl control) {
     return () -> {
-      state.setMaxSize(state.inUse.size());
+      state.setMaxSize(control.getMaxSize(state.inUse.size()));
     };
   }
 
