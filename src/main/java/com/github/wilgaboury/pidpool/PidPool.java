@@ -82,6 +82,8 @@ public class PidPool<T> {
   }
 
   public void give(T obj) {
+    state.inUse.remove(obj);
+
     synchronized (state.queue) {
       if (state.queue.size() < state.maxSize) {
         state.queue.add(obj);
@@ -90,7 +92,6 @@ public class PidPool<T> {
     }
 
     if (obj != null) {
-      state.inUse.remove(obj);
       state.lifecycle.destroy(obj);
     }
   }
